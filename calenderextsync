@@ -1,0 +1,225 @@
+// ============================================
+// CALENDAR SYNC SCRIPT
+// ============================================
+// Dieses Google Apps Script synchronisiert Events von einer ICS-URL
+// mit einem Google Kalender. Es löscht alte Events und fügt neue hinzu.
+// Vorteil: Der Kalender kann anderen Personen freigegeben werden,
+// was bei klassischen Kalender-Einbindungen nicht möglich ist.
+
+
+// Konfigurationskonstanten
+const CALENDAR_ID = ""; // Ziel-Kalender ID
+const ICS_URL = ""; // ICS-Quelle URL
+const STATUS_EMAIL = ""; // E-Mail für Status-Benachrichtigungen
+const EVENT_PREFIX = "family"; // Präfix zur Identifikation der Events (kann für andere Anwendungen geändert werden)
+
+// Event-Konfiguration
+const ENABLE_DURATION_MODIFICATION = true; // Ob die Event-Dauer modifiziert werden soll (false = ursprüngliche Dauer aus ICS verwenden)
+const EVENT_DURATION_MINUTES = 60; // Standard-Dauer der Events in Minuten
+const ENABLE_REMINDERS = true; // Ob Erinnerungen aktiviert werden sollen
+const REMINDER_MINUTES_BEFORE = 30; // Minuten vor dem Event für die Erinnerung
+
+/**
+ * Hauptfunktion zur Kalender-Synchronisation
+ * Diese Funktion wird als Trigger ausgeführt und führt folgende Schritte aus:
+ * 1. Alle bestehenden Events mit dem konfigurierten Präfix löschen
+ * 2. Neue Events von der ICS-URL abrufen
+ * 3. Events im Google Kalender anlegen
+ * 4. Status-E-Mail versenden
+ */
+function syncCalendar() {
+  // Kalender-Objekt abrufen
+  const calendar = CalendarApp.getCalendarById(CALENDAR_ID);
+  if (!calendar) {
+    Logger.log("❌ Kalender nicht gefunden.");
+    return;
+  }
+
+  // Zeitzone des Kalenders für korrekte Zeitkonvertierung
+  const timeZone = calendar.getTimeZone();
+
+  // Zeitraum für Events definieren: von 2000 bis 1 Jahr in die Zukunft
+  // Dies stellt sicher, dass alle relevanten Events erfasst werden
+  const fromDate = new Date(2000, 0, 1);
+  const toDate = new Date();
+  toDate.setDate(toDate.getDate() + 365);
+
+  // Alle Events im definierten Zeitraum abrufen
+  const events = calendar.getEvents(fromDate, toDate);
+  const totalEvents = events.length;
+
+  // Schritt 1: Alle bestehenden Events mit dem konfigurierten Präfix löschen
+  let deletedCount = 0;
+  events.forEach(e => {
+    // Events werden anhand des Titels identifiziert (muss mit EVENT_PREFIX beginnen)
+    if (e.getTitle().toLowerCase().startsWith(EVENT_PREFIX.toLowerCase())) {
+      e.deleteEvent();
+      deletedCount++;
+      Logger.log(`  Event gelöscht: ${e.getTitle()}`);
+    }
+  });
+
+  // Schritt 2: ICS-Datei von der konfigurierten URL abrufen
+  const response = UrlFetchApp.fetch(ICS_URL);
+  const ics = response.getContentText();
+  
+  // ICS-Datei parsen und Events extrahieren
+  const parsedEvents = parseICS(ics, timeZone);
+
+  // Schritt 3: Neue Events im Kalender anlegen
+  parsedEvents.forEach(ev => {
+    // Endzeit berechnen: entweder modifiziert oder ursprünglich aus ICS
+    const endTime = ENABLE_DURATION_MODIFICATION 
+      ? new Date(ev.start.getTime() + EVENT_DURATION_MINUTES * 60 * 1000) // Konfigurierbare Dauer
+      : ev.end; // Ursprüngliche Dauer aus ICS verwenden
+    
+    // Events werden mit EVENT_PREFIX Präfix angelegt für einfache Identifikation
+    const event = calendar.createEvent(
+      EVENT_PREFIX + " " + ev.title,
+      ev.start,
+      endTime,
+      {
+        location: ev.location,
+        description: ev.description,
+      }
+    );
+    
+    // Erinnerung hinzufügen falls aktiviert
+    if (ENABLE_REMINDERS) {
+      event.addPopupReminder(REMINDER_MINUTES_BEFORE);
+    }
+  });
+
+  const addedCount = parsedEvents.length;
+
+  Logger.log(`✅ ${addedCount} Events hinzugefügt.`);
+
+  // Schritt 4: Status-E-Mail mit Zusammenfassung versenden
+  const subject = `${EVENT_PREFIX.charAt(0).toUpperCase() + EVENT_PREFIX.slice(1)} Kalender Sync Status`;
+  const body = `Hallo,
+
+Der Sync des externen Kalenders wurde durchgeführt.
+
+- Gesamte Events im Zeitraum: ${totalEvents}
+- Gelöschte Events (${EVENT_PREFIX}): ${deletedCount}
+- Hinzugefügte Events: ${addedCount}
+
+Viele Grüße,
+Dein Sync-Script`;
+
+  MailApp.sendEmail(STATUS_EMAIL, subject, body);
+}
+
+/**
+ * Parst eine ICS-Datei und extrahiert alle Events
+ * @param {string} ics - Der ICS-Dateiinhalt als String
+ * @param {string} timeZone - Die Zeitzone für die Zeitkonvertierung
+ * @return {Array} Array von Event-Objekten mit title, start, end, location, description
+ */
+function parseICS(ics, timeZone) {
+  const events = [];
+  
+  // ICS-Datei in VEVENT-Blöcke aufteilen (jeder Block repräsentiert ein Event)
+  const veventBlocks = ics.split("BEGIN:VEVENT").slice(1);
+
+  // Jeden VEVENT-Block verarbeiten
+  veventBlocks.forEach(block => {
+    // Hilfsfunktion zum Extrahieren von ICS-Feldern
+    const get = (key) => {
+      const regex = new RegExp(key + ".*:(.+)");
+      const match = block.match(regex);
+      return match ? match[1].trim() : "";
+    };
+
+    // Event-Daten aus ICS-Block extrahieren
+    const start = parseICSTime(get("DTSTART"), timeZone);
+    const end = parseICSTime(get("DTEND"), timeZone);
+    const summary = get("SUMMARY");
+    const location = get("LOCATION");
+    const description = get("DESCRIPTION");
+
+    // Nur Events mit gültigen Start- und Endzeiten sowie Titel hinzufügen
+    if (start && end && summary) {
+      events.push({
+        title: summary,
+        start: start,
+        end: end,
+        location: location,
+        description: description
+      });
+    }
+  });
+
+  return events;
+}
+
+/**
+ * Konvertiert ICS-Zeitstempel in JavaScript Date-Objekte
+ * Unterstützt sowohl UTC-Zeiten (mit Z-Suffix) als auch lokale Zeiten
+ * @param {string} str - ICS-Zeitstempel (z.B. "20231201T100000Z")
+ * @param {string} timeZone - Ziel-Zeitzone für die Konvertierung
+ * @return {Date|null} JavaScript Date-Objekt oder null bei ungültiger Zeit
+ */
+function parseICSTime(str, timeZone) {
+  if (!str) return null;
+
+  // UTC-Zeit verarbeiten (endet mit Z)
+  if (str.endsWith("Z")) {
+    const cleaned = str.replace("Z", "");
+    const match = cleaned.match(/(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})?/);
+    if (!match) return null;
+
+    const [ , y, m, d, h, min, s ] = match;
+    // UTC-Datum erstellen
+    const utcDate = new Date(Date.UTC(y, m - 1, d, h, min, s || 0));
+    
+    // Zeitzonen-Offset berechnen und anwenden
+    const offsetMinutes = getTimezoneOffsetMinutes(timeZone, utcDate);
+    const offsetMs = offsetMinutes * 60 * 1000;
+    return new Date(utcDate.getTime() + offsetMs);
+
+  } else {
+    // Lokale Zeit verarbeiten (ohne Z-Suffix)
+    const match = str.match(/(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})?/);
+    if (!match) return null;
+
+    const [ , y, m, d, h, min, s ] = match;
+    return new Date(y, m - 1, d, h, min, s || 0);
+  }
+}
+
+/**
+ * Berechnet den Zeitzonen-Offset zwischen UTC und der angegebenen Zeitzone
+ * für ein bestimmtes Datum (wichtig für Sommer-/Winterzeit)
+ * @param {string} timeZone - Die Ziel-Zeitzone (z.B. "Europe/Berlin")
+ * @param {Date} date - Das Datum für die Offset-Berechnung
+ * @return {number} Offset in Minuten
+ */
+function getTimezoneOffsetMinutes(timeZone, date) {
+  // Datum in UTC und Ziel-Zeitzone formatieren
+  const utcString = Utilities.formatDate(date, "UTC", "yyyyMMdd'T'HHmmss");
+  const tzString = Utilities.formatDate(date, timeZone, "yyyyMMdd'T'HHmmss");
+
+  // UTC-Datum aus String parsen
+  const utcDate = new Date(
+    parseInt(utcString.substring(0,4)), 
+    parseInt(utcString.substring(4,6))-1,
+    parseInt(utcString.substring(6,8)),
+    parseInt(utcString.substring(9,11)),
+    parseInt(utcString.substring(11,13)),
+    parseInt(utcString.substring(13,15))
+  );
+
+  // Zeitzonen-Datum aus String parsen
+  const tzDate = new Date(
+    parseInt(tzString.substring(0,4)), 
+    parseInt(tzString.substring(4,6))-1,
+    parseInt(tzString.substring(6,8)),
+    parseInt(tzString.substring(9,11)),
+    parseInt(tzString.substring(11,13)),
+    parseInt(tzString.substring(13,15))
+  );
+
+  // Differenz in Minuten berechnen
+  return (tzDate.getTime() - utcDate.getTime()) / (60 * 1000);
+}
