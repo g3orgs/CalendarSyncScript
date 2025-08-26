@@ -11,13 +11,20 @@
 const CALENDAR_ID = ""; // Ziel-Kalender ID
 const ICS_URL = ""; // ICS-Quelle URL
 const STATUS_EMAIL = ""; // E-Mail für Status-Benachrichtigungen
-const EVENT_PREFIX = "family"; // Präfix zur Identifikation der Events (kann für andere Anwendungen geändert werden)
+const EVENT_PREFIX = ""; // Präfix zur Identifikation der Events (kann für andere Anwendungen geändert werden)
 
 // Event-Konfiguration
 const ENABLE_DURATION_MODIFICATION = true; // Ob die Event-Dauer modifiziert werden soll (false = ursprüngliche Dauer aus ICS verwenden)
 const EVENT_DURATION_MINUTES = 60; // Standard-Dauer der Events in Minuten
 const ENABLE_REMINDERS = true; // Ob Erinnerungen aktiviert werden sollen
 const REMINDER_MINUTES_BEFORE = 30; // Minuten vor dem Event für die Erinnerung
+
+// Filter-Konfiguration
+// INCLUDE_TERMS: Wenn nicht leer, werden NUR Events importiert, die einen dieser Begriffe enthalten
+// EXCLUDE_TERMS: Events, die einen dieser Begriffe enthalten, werden NICHT importiert
+// Groß-/Kleinschreibung wird ignoriert. Es wird in Titel, Beschreibung und Ort gesucht.
+const INCLUDE_TERMS = []; // z.B. ["abholung", "meeting"]
+const EXCLUDE_TERMS = []; // z.B. ["storniert", "abgesagt"]
 
 /**
  * Hauptfunktion zur Kalender-Synchronisation
@@ -66,8 +73,12 @@ function syncCalendar() {
   // ICS-Datei parsen und Events extrahieren
   const parsedEvents = parseICS(ics, timeZone);
 
+  // Events anhand Include/Exclude-Filter filtern
+  const filteredEvents = parsedEvents.filter(shouldImportEvent);
+  const skippedCount = parsedEvents.length - filteredEvents.length;
+
   // Schritt 3: Neue Events im Kalender anlegen
-  parsedEvents.forEach(ev => {
+  filteredEvents.forEach(ev => {
     // Endzeit berechnen: entweder modifiziert oder ursprünglich aus ICS
     const endTime = ENABLE_DURATION_MODIFICATION 
       ? new Date(ev.start.getTime() + EVENT_DURATION_MINUTES * 60 * 1000) // Konfigurierbare Dauer
@@ -90,9 +101,9 @@ function syncCalendar() {
     }
   });
 
-  const addedCount = parsedEvents.length;
+  const addedCount = filteredEvents.length;
 
-  Logger.log(`✅ ${addedCount} Events hinzugefügt.`);
+  Logger.log(`✅ ${addedCount} Events hinzugefügt. (${skippedCount} gefiltert)`);
 
   // Schritt 4: Status-E-Mail mit Zusammenfassung versenden
   const subject = `${EVENT_PREFIX.charAt(0).toUpperCase() + EVENT_PREFIX.slice(1)} Kalender Sync Status`;
@@ -102,6 +113,7 @@ Der Sync des externen Kalenders wurde durchgeführt.
 
 - Gesamte Events im Zeitraum: ${totalEvents}
 - Gelöschte Events (${EVENT_PREFIX}): ${deletedCount}
+- Gefilterte Events: ${skippedCount}
 - Hinzugefügte Events: ${addedCount}
 
 Viele Grüße,
@@ -222,4 +234,50 @@ function getTimezoneOffsetMinutes(timeZone, date) {
 
   // Differenz in Minuten berechnen
   return (tzDate.getTime() - utcDate.getTime()) / (60 * 1000);
+}
+
+/**
+ * Prüft, ob ein Event gemäß Include-/Exclude-Filter importiert werden soll
+ * - Wenn INCLUDE_TERMS nicht leer: Event muss mindestens einen Begriff enthalten
+ * - Wenn EXCLUDE_TERMS nicht leer: Event darf keinen Begriff enthalten
+ * Es wird in Titel, Beschreibung und Ort gesucht (case-insensitive)
+ * @param {{title:string, description:string, location:string}} ev
+ * @return {boolean}
+ */
+function shouldImportEvent(ev) {
+  const text = buildSearchText(ev);
+
+  // Include-Filter (falls gesetzt, mindestens ein Begriff muss vorkommen)
+  if (INCLUDE_TERMS && INCLUDE_TERMS.length > 0) {
+    if (!containsAny(text, INCLUDE_TERMS)) return false;
+  }
+
+  // Exclude-Filter (falls gesetzt, keiner der Begriffe darf vorkommen)
+  if (EXCLUDE_TERMS && EXCLUDE_TERMS.length > 0) {
+    if (containsAny(text, EXCLUDE_TERMS)) return false;
+  }
+
+  return true;
+}
+
+/**
+ * Baut einen durchsuchbaren Text aus Titel, Beschreibung und Ort
+ * @param {{title:string, description:string, location:string}} ev
+ * @return {string}
+ */
+function buildSearchText(ev) {
+  return [ev.title || "", ev.description || "", ev.location || ""]
+    .join(" \n ")
+    .toLowerCase();
+}
+
+/**
+ * Prüft, ob einer der Begriffe im Text vorkommt (case-insensitive)
+ * @param {string} text
+ * @param {string[]} terms
+ * @return {boolean}
+ */
+function containsAny(text, terms) {
+  const normalized = text.toLowerCase();
+  return terms.some(t => normalized.includes(String(t).toLowerCase()));
 }
