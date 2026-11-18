@@ -1,13 +1,13 @@
 # 📅 Calendar Sync
 
-A Google Apps Script for automatic synchronization of external ICS calendars with Google Calendar. This tool allows you to import read-only calendars from any ICS source into your own Google Calendar and share it with others.
+A Google Apps Script for automatic synchronization of external ICS calendars with Google Calendar. This tool allows you to import read-only calendars from an authenticated ICS feed into your own Google Calendar and share it with others.
 
 ## ✨ Features
 
 - 🔄 **Automatic synchronization** of ICS calendars
-- 🗑️ **Smart deletion** of old events before reloading
+- 🔑 **UID-based updates** and deletion of managed events that have disappeared from a validated feed
 - 📧 **Email notifications** about sync status
-- ⏰ **Automatic reminders** (30 minutes before event)
+- ⏰ **Popup reminders** 24 hours and 2 hours before each event
 - 🌍 **Timezone support** with daylight saving time
 - 🔧 **Flexible configuration** for various use cases
 - 👥 **Sharing capability** (unlike classic calendar subscriptions)
@@ -25,7 +25,7 @@ A Google Apps Script for automatic synchronization of external ICS calendars wit
 
 - Google Workspace Account
 - Access to Google Apps Script
-- ICS URL of an external calendar source
+- An HTTPS ICS feed, its read token, and write access to the target Google calendar
 
 ## 🛠️ Installation
 
@@ -39,220 +39,44 @@ A Google Apps Script for automatic synchronization of external ICS calendars wit
 
 Copy the entire code from the `calenderextsync` file into the editor.
 
-### 3. Configure Settings
+### 3. Configure settings
 
-Edit the configuration constants at the beginning of the script:
+Keep the existing value of `CALENDAR_ID` when replacing the code in an installed project. For a new project, find the ID under **Google Calendar → Settings and sharing → Integrate calendar**.
 
-```javascript
-const CALENDAR_ID = "your_calendar_id@group.calendar.google.com";
-const ICS_URL = "https://example.com/calendar.ics";
-const STATUS_EMAIL = "your-email@domain.com";
-const EVENT_PREFIX = "external";
+In **Apps Script → Project Settings → Script Properties**, add these properties.
 
-// Event Configuration
-const ENABLE_DURATION_MODIFICATION = true; // Whether to modify event duration
-const EVENT_DURATION_MINUTES = 60; // Standard event duration in minutes
-const ENABLE_REMINDERS = true; // Whether reminders should be activated
-const REMINDER_MINUTES_BEFORE = 30; // Minutes before event for reminder
-```
+| Property | Value |
+|----------|-------|
+| `ICS_URL` | `https://calendar-sync.o-ab7.workers.dev/calendar.ics` |
+| `ICS_READ_TOKEN` | The worker's read token, entered directly in Apps Script |
 
-### 4. Find Calendar ID
+The script sends the token as a Bearer header over HTTPS and leaves redirects unfollowed. The execution log includes counts and sanitized error messages.
 
-1. Open Google Calendar
-2. Click on the desired calendar
-3. Click the three dots → "Settings and sharing"
-4. Scroll down to "Integrate calendar" → "Calendar ID"
+### 4. Enable Google Calendar access
 
-### 5. Grant Permissions
+In the Apps Script editor, add **Google Calendar API** under **Services** with the identifier `Calendar`. For a standard Google Cloud project, also enable the Google Calendar API in that Cloud project. Run `syncCalendar` once from the editor to authorize access. Existing time-driven triggers continue to call `syncCalendar`.
 
-1. Click "Run" → "syncCalendar"
-2. Grant the required permissions:
-   - Read/write calendar
-   - Send emails
-   - Fetch external URLs
+## 🔄 Synchronization
+
+- The script reads and validates the full feed before accessing Google Calendar. An HTTP error, an invalid or unsupported feed, or a duplicate ICS UID stops the run.
+- Existing managed events keep their Google event ID. The script creates missing UIDs and deletes managed events whose UIDs are absent from the feed after successful creates and updates.
+- Events made by older versions carry no UID marker. They remain in place and can appear next to newly synced copies on the first run. Check those older entries individually before removing any.
+- The supported feed contains individual timed events in UTC or `Europe/Berlin`. Floating times are interpreted as Berlin local time. A valid feed without events can contain a `VTIMEZONE` component. A componentless response stops the run.
+- Google Calendar stores the two reminder overrides for the account running the sync.
 
 ## ⚙️ Configuration
 
-### Configuration Variables
+| Variable | Description |
+|----------|-------------|
+| `STATUS_EMAIL` | Optional recipient for the sync-count summary |
+| `EVENT_PREFIX` | Optional prefix for imported titles |
+| `INCLUDE_TERMS`, `EXCLUDE_TERMS` | Filter creates and updates by title, description or location. Existing UIDs still in the feed are retained. |
+| `ENABLE_DURATION_MODIFICATION` | Use the configured duration when true, or use the feed's `DTEND` or `DURATION` when false |
+| `EVENT_DURATION_MINUTES` | Configured duration and fallback for events with only a start time. Defaults to 60 minutes. |
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `CALENDAR_ID` | Target calendar ID | `"abc123@group.calendar.google.com"` |
-| `ICS_URL` | ICS file URL | `"https://example.com/calendar.ics"` |
-| `STATUS_EMAIL` | Email for status notifications | `"admin@domain.com"` |
-| `EVENT_PREFIX` | Prefix for event titles | `"external"`, `"club"`, `"work"` |
-| `EVENT_DURATION_MINUTES` | Standard event duration in minutes | `60`, `30`, `120` |
-| `ENABLE_DURATION_MODIFICATION` | Modify event duration or use original | `true`, `false` |
-| `ENABLE_REMINDERS` | Enable/disable reminders | `true`, `false` |
-| `REMINDER_MINUTES_BEFORE` | Minutes before event for reminder | `30`, `60`, `15` |
+## 🧪 Tests
 
-### Example Configurations
-
-#### Sports Club
-```javascript
-const EVENT_PREFIX = "sportsclub";
-const ICS_URL = "https://sportsclub.com/schedule.ics";
-```
-
-#### Choir
-```javascript
-const EVENT_PREFIX = "choir";
-const ICS_URL = "https://choir-website.com/events.ics";
-```
-
-#### Work Calendar
-```javascript
-const EVENT_PREFIX = "work";
-const ICS_URL = "https://company.com/vacation.ics";
-```
-
-## 🔄 Automation
-
-### Set up time-based triggers
-
-1. Click on the clock icon (Triggers)
-2. "Add trigger"
-3. Configure:
-   - **Function:** `syncCalendar`
-   - **Source:** Time-driven
-   - **Time-based trigger:** Daily, weekly, or hourly
-   - **Time:** Choose a suitable time (e.g., 06:00)
-
-### Recommended trigger settings
-
-| Application | Frequency | Recommended Time |
-|-------------|-----------|------------------|
-| Sports Club | Daily | 06:00 |
-| Choir | Weekly | Sunday 10:00 |
-| Work Calendar | Hourly | Every hour |
-
-## 📧 Email Notifications
-
-The script sends a status email after each synchronization with:
-
-- Total number of events in the period
-- Number of deleted events
-- Number of added events
-
-### Example Email
-```
-Hello,
-
-The external calendar sync has been completed.
-
-- Total events in period: 45
-- Deleted events (external): 12
-- Added events: 15
-
-Best regards,
-Your Sync Script
-```
-
-## 🔧 Customization
-
-### Configure Event Duration
-
-#### Enable/disable duration modification
-```javascript
-const ENABLE_DURATION_MODIFICATION = true; // All events have the same duration
-const ENABLE_DURATION_MODIFICATION = false; // Use original duration from ICS
-```
-
-**When to use which setting?**
-- **`true`**: When all events should have the same duration (e.g., all meetings 1 hour)
-- **`false`**: When original event durations from the ICS file should be preserved
-
-#### Change event duration (only if ENABLE_DURATION_MODIFICATION = true)
-```javascript
-const EVENT_DURATION_MINUTES = 60; // 1 hour
-const EVENT_DURATION_MINUTES = 30; // 30 minutes
-const EVENT_DURATION_MINUTES = 120; // 2 hours
-const EVENT_DURATION_MINUTES = 90; // 1.5 hours
-```
-
-### Configure Reminders
-
-#### Enable/disable reminders
-```javascript
-const ENABLE_REMINDERS = true; // Reminders activated
-const ENABLE_REMINDERS = false; // No reminders
-```
-
-#### Adjust reminder time
-```javascript
-const REMINDER_MINUTES_BEFORE = 30; // 30 minutes before
-const REMINDER_MINUTES_BEFORE = 60; // 1 hour before
-const REMINDER_MINUTES_BEFORE = 15; // 15 minutes before
-const REMINDER_MINUTES_BEFORE = 1440; // 1 day before (24h * 60min)
-```
-
-### Example Configurations
-
-#### Preserve original event durations
-```javascript
-const ENABLE_DURATION_MODIFICATION = false; // Use original duration
-const ENABLE_REMINDERS = true;
-const REMINDER_MINUTES_BEFORE = 30;
-```
-
-#### Short events without reminders
-```javascript
-const ENABLE_DURATION_MODIFICATION = true;
-const EVENT_DURATION_MINUTES = 30;
-const ENABLE_REMINDERS = false;
-```
-
-#### Long events with early reminder
-```javascript
-const ENABLE_DURATION_MODIFICATION = true;
-const EVENT_DURATION_MINUTES = 180; // 3 hours
-const ENABLE_REMINDERS = true;
-const REMINDER_MINUTES_BEFORE = 60; // 1 hour before
-```
-
-#### All-day events with day advance
-```javascript
-const ENABLE_DURATION_MODIFICATION = true;
-const EVENT_DURATION_MINUTES = 480; // 8 hours
-const ENABLE_REMINDERS = true;
-const REMINDER_MINUTES_BEFORE = 1440; // 1 day before
-```
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-#### "Calendar not found"
-- Check the `CALENDAR_ID`
-- Make sure you have access to the calendar
-
-#### "ICS URL not reachable"
-- Check the `ICS_URL`
-- Test the URL in browser
-- Make sure the URL is publicly accessible
-
-#### "Missing permissions"
-- Run the script manually
-- Grant all required permissions
-
-### Debugging
-
-Enable logging in Google Apps Script:
-
-1. Click "Run" → "syncCalendar"
-2. Click "View execution log"
-3. Check the log outputs
-
-## 📝 Logs
-
-The script creates detailed logs:
-
-```
-❌ Calendar not found.
-  Event deleted: external Training
-  Event deleted: external Game
-✅ 15 events added.
-```
+Run `node tests/calendar-sync.test.cjs` to exercise authenticated fetching, ICS parsing and calendar reconciliation with mocked Apps Script services.
 
 ## 🤝 Contributing
 

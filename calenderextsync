@@ -1,283 +1,354 @@
-// ============================================
-// CALENDAR SYNC SCRIPT
-// ============================================
-// Dieses Google Apps Script synchronisiert Events von einer ICS-URL
-// mit einem Google Kalender. Es löscht alte Events und fügt neue hinzu.
-// Vorteil: Der Kalender kann anderen Personen freigegeben werden,
-// was bei klassischen Kalender-Einbindungen nicht möglich ist.
+// Google Apps Script. Enable the advanced Google Calendar service (Calendar).
+const CALENDAR_ID = ""; // Keep the existing target calendar ID here.
+const STATUS_EMAIL = ""; // Optional sync summary.
+const EVENT_PREFIX = ""; // Optional title prefix.
+const ENABLE_DURATION_MODIFICATION = true;
+const EVENT_DURATION_MINUTES = 60; // Also used when the feed omits DTEND and DURATION.
+const INCLUDE_TERMS = [];
+const EXCLUDE_TERMS = [];
 
+const SOURCE_TIME_ZONE = "Europe/Berlin";
+const SYNC_SOURCE = "CalendarSyncScript";
+const REMINDER_MINUTES = [1440, 120];
 
-// Konfigurationskonstanten
-const CALENDAR_ID = ""; // Ziel-Kalender ID
-const ICS_URL = ""; // ICS-Quelle URL
-const STATUS_EMAIL = ""; // E-Mail für Status-Benachrichtigungen
-const EVENT_PREFIX = ""; // Präfix zur Identifikation der Events (kann für andere Anwendungen geändert werden)
-
-// Event-Konfiguration
-const ENABLE_DURATION_MODIFICATION = true; // Ob die Event-Dauer modifiziert werden soll (false = ursprüngliche Dauer aus ICS verwenden)
-const EVENT_DURATION_MINUTES = 60; // Standard-Dauer der Events in Minuten
-const ENABLE_REMINDERS = true; // Ob Erinnerungen aktiviert werden sollen
-const REMINDER_MINUTES_BEFORE = 30; // Minuten vor dem Event für die Erinnerung
-
-// Filter-Konfiguration
-// INCLUDE_TERMS: Wenn nicht leer, werden NUR Events importiert, die einen dieser Begriffe enthalten
-// EXCLUDE_TERMS: Events, die einen dieser Begriffe enthalten, werden NICHT importiert
-// Groß-/Kleinschreibung wird ignoriert. Es wird in Titel, Beschreibung und Ort gesucht.
-const INCLUDE_TERMS = []; // z.B. ["abholung", "meeting"]
-const EXCLUDE_TERMS = []; // z.B. ["storniert", "abgesagt"]
-
-/**
- * Hauptfunktion zur Kalender-Synchronisation
- * Diese Funktion wird als Trigger ausgeführt und führt folgende Schritte aus:
- * 1. Alle bestehenden Events mit dem konfigurierten Präfix löschen
- * 2. Neue Events von der ICS-URL abrufen
- * 3. Events im Google Kalender anlegen
- * 4. Status-E-Mail versenden
- */
 function syncCalendar() {
-  // Kalender-Objekt abrufen
-  const calendar = CalendarApp.getCalendarById(CALENDAR_ID);
-  if (!calendar) {
-    Logger.log("❌ Kalender nicht gefunden.");
-    return;
-  }
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(0)) return;
 
-  // Zeitzone des Kalenders für korrekte Zeitkonvertierung
-  const timeZone = calendar.getTimeZone();
+  try {
+    const events = fetchCalendarFeed();
+    const desired = events.filter(shouldImportEvent).map(event => ({
+      uid: event.uid,
+      resource: calendarResource(event),
+    }));
 
-  // Zeitraum für Events definieren: von 2000 bis 1 Jahr in die Zukunft
-  // Dies stellt sicher, dass alle relevanten Events erfasst werden
-  const fromDate = new Date(2000, 0, 1);
-  const toDate = new Date();
-  toDate.setDate(toDate.getDate() + 365);
-
-  // Alle Events im definierten Zeitraum abrufen
-  const events = calendar.getEvents(fromDate, toDate);
-  const totalEvents = events.length;
-
-  // Schritt 1: Alle bestehenden Events mit dem konfigurierten Präfix löschen
-  let deletedCount = 0;
-  events.forEach(e => {
-    // Events werden anhand des Titels identifiziert (muss mit EVENT_PREFIX beginnen)
-    if (e.getTitle().toLowerCase().startsWith(EVENT_PREFIX.toLowerCase())) {
-      e.deleteEvent();
-      deletedCount++;
-      Logger.log(`  Event gelöscht: ${e.getTitle()}`);
+    if (!CALENDAR_ID) throw new Error("Configure CALENDAR_ID.");
+    if (typeof Calendar === "undefined") {
+      throw new Error("Enable the advanced Google Calendar service in Apps Script.");
     }
-  });
 
-  // Schritt 2: ICS-Datei von der konfigurierten URL abrufen
-  const response = UrlFetchApp.fetch(ICS_URL);
-  const ics = response.getContentText();
-  
-  // ICS-Datei parsen und Events extrahieren
-  const parsedEvents = parseICS(ics, timeZone);
-
-  // Events anhand Include/Exclude-Filter filtern
-  const filteredEvents = parsedEvents.filter(shouldImportEvent);
-  const skippedCount = parsedEvents.length - filteredEvents.length;
-
-  // Schritt 3: Neue Events im Kalender anlegen
-  filteredEvents.forEach(ev => {
-    // Endzeit berechnen: entweder modifiziert oder ursprünglich aus ICS
-    const endTime = ENABLE_DURATION_MODIFICATION 
-      ? new Date(ev.start.getTime() + EVENT_DURATION_MINUTES * 60 * 1000) // Konfigurierbare Dauer
-      : ev.end; // Ursprüngliche Dauer aus ICS verwenden
-    
-    // Events werden mit EVENT_PREFIX Präfix angelegt für einfache Identifikation
-    const event = calendar.createEvent(
-      EVENT_PREFIX + " " + ev.title,
-      ev.start,
-      endTime,
-      {
-        location: ev.location,
-        description: ev.description,
+    let counts;
+    try {
+      counts = reconcileCalendar(events, desired);
+    } catch (_) {
+      throw new Error("Google Calendar synchronization failed. Check calendar access and managed entries.");
+    }
+    const summary = `Calendar sync: ${counts.added} added, ${counts.updated} updated, ${counts.deleted} deleted, ${events.length - desired.length} filtered.`;
+    Logger.log(summary);
+    if (STATUS_EMAIL) {
+      try {
+        MailApp.sendEmail(STATUS_EMAIL, "Calendar sync status", summary);
+      } catch (_) {
+        throw new Error("Calendar sync completed, but the status email failed.");
       }
-    );
-    
-    // Erinnerung hinzufügen falls aktiviert
-    if (ENABLE_REMINDERS) {
-      event.addPopupReminder(REMINDER_MINUTES_BEFORE);
     }
-  });
-
-  const addedCount = filteredEvents.length;
-
-  Logger.log(`✅ ${addedCount} Events hinzugefügt. (${skippedCount} gefiltert)`);
-
-  // Schritt 4: Status-E-Mail mit Zusammenfassung versenden
-  const subject = `${EVENT_PREFIX.charAt(0).toUpperCase() + EVENT_PREFIX.slice(1)} Kalender Sync Status`;
-  const body = `Hallo,
-
-Der Sync des externen Kalenders wurde durchgeführt.
-
-- Gesamte Events im Zeitraum: ${totalEvents}
-- Gelöschte Events (${EVENT_PREFIX}): ${deletedCount}
-- Gefilterte Events: ${skippedCount}
-- Hinzugefügte Events: ${addedCount}
-
-Viele Grüße,
-Dein Sync-Script`;
-
-  MailApp.sendEmail(STATUS_EMAIL, subject, body);
+  } finally {
+    lock.releaseLock();
+  }
 }
 
-/**
- * Parst eine ICS-Datei und extrahiert alle Events
- * @param {string} ics - Der ICS-Dateiinhalt als String
- * @param {string} timeZone - Die Zeitzone für die Zeitkonvertierung
- * @return {Array} Array von Event-Objekten mit title, start, end, location, description
- */
-function parseICS(ics, timeZone) {
-  const events = [];
-  
-  // ICS-Datei in VEVENT-Blöcke aufteilen (jeder Block repräsentiert ein Event)
-  const veventBlocks = ics.split("BEGIN:VEVENT").slice(1);
+function fetchCalendarFeed() {
+  const properties = PropertiesService.getScriptProperties();
+  const url = properties.getProperty("ICS_URL");
+  const token = properties.getProperty("ICS_READ_TOKEN");
+  if (!url || !/^https:\/\/[^\s/@]+(?:\/[^\s]*)?$/i.test(url) || !token || /\s/.test(token)) {
+    throw new Error("Configure HTTPS ICS_URL and ICS_READ_TOKEN in Script Properties.");
+  }
 
-  // Jeden VEVENT-Block verarbeiten
-  veventBlocks.forEach(block => {
-    // Hilfsfunktion zum Extrahieren von ICS-Feldern
-    const get = (key) => {
-      const regex = new RegExp(key + ".*:(.+)");
-      const match = block.match(regex);
-      return match ? match[1].trim() : "";
-    };
+  let status;
+  let bytes;
+  try {
+    const response = UrlFetchApp.fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      followRedirects: false,
+      muteHttpExceptions: true,
+    });
+    status = response.getResponseCode();
+    if (status === 200) bytes = response.getContent();
+  } catch (_) {
+    throw new Error("Unable to fetch the ICS feed.");
+  }
+  if (status !== 200) throw new Error(`ICS fetch failed (HTTP ${status}).`);
 
-    // Event-Daten aus ICS-Block extrahieren
-    const start = parseICSTime(get("DTSTART"), timeZone);
-    const end = parseICSTime(get("DTEND"), timeZone);
-    const summary = get("SUMMARY");
-    const location = get("LOCATION");
-    const description = get("DESCRIPTION");
+  try {
+    return parseICS(decodeCalendarBody(bytes));
+  } catch (_) {
+    throw new Error("Invalid or unsupported ICS feed. Calendar synchronization skipped.");
+  }
+}
 
-    // Nur Events mit gültigen Start- und Endzeiten sowie Titel hinzufügen
-    if (start && end && summary) {
-      events.push({
-        title: summary,
-        start: start,
-        end: end,
-        location: location,
-        description: description
-      });
+function decodeCalendarBody(bytes) {
+  // Unfold before decoding so a fold inside a multibyte UTF-8 character is reversible.
+  const unfolded = [];
+  for (let index = 0; index < bytes.length; index++) {
+    const newline = bytes[index] === 13 && bytes[index + 1] === 10 ? index + 1 : index;
+    if (bytes[newline] === 10 && (bytes[newline + 1] === 32 || bytes[newline + 1] === 9)) {
+      index = newline + 1;
+    } else {
+      unfolded.push(bytes[index]);
     }
-  });
-
-  return events;
+  }
+  return Utilities.newBlob(unfolded).getDataAsString("UTF-8");
 }
 
-/**
- * Konvertiert ICS-Zeitstempel in JavaScript Date-Objekte
- * Unterstützt sowohl UTC-Zeiten (mit Z-Suffix) als auch lokale Zeiten
- * @param {string} str - ICS-Zeitstempel (z.B. "20231201T100000Z")
- * @param {string} timeZone - Ziel-Zeitzone für die Konvertierung
- * @return {Date|null} JavaScript Date-Objekt oder null bei ungültiger Zeit
- */
-function parseICSTime(str, timeZone) {
-  if (!str) return null;
+function parseICS(ics) {
+  const lines = ics.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n")
+    .replace(/\n[ \t]/g, "").replace(/\n+$/, "").split("\n");
+  const stack = [];
+  const calendar = new Map();
+  const events = new Map();
+  const children = {
+    VCALENDAR: ["VEVENT", "VTIMEZONE"],
+    VEVENT: ["VALARM"],
+    VTIMEZONE: ["STANDARD", "DAYLIGHT"],
+  };
+  let componentCount = 0;
+  let closed = false;
 
-  // UTC-Zeit verarbeiten (endet mit Z)
-  if (str.endsWith("Z")) {
-    const cleaned = str.replace("Z", "");
-    const match = cleaned.match(/(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})?/);
-    if (!match) return null;
+  for (const line of lines) {
+    const { name, parameters, value } = parseContentLine(line);
+    const component = stack[stack.length - 1];
 
-    const [ , y, m, d, h, min, s ] = match;
-    // UTC-Datum erstellen
-    const utcDate = new Date(Date.UTC(y, m - 1, d, h, min, s || 0));
-    
-    // Zeitzonen-Offset berechnen und anwenden
-    const offsetMinutes = getTimezoneOffsetMinutes(timeZone, utcDate);
-    const offsetMs = offsetMinutes * 60 * 1000;
-    return new Date(utcDate.getTime() + offsetMs);
+    if (name === "BEGIN") {
+      const type = value.toUpperCase();
+      const allowed = component ? children[component.type] || [] : ["VCALENDAR"];
+      if (closed || parameters.size || !allowed.includes(type)) throw new Error("Invalid BEGIN.");
+      if (component?.type === "VCALENDAR") componentCount++;
+      stack.push({ type, properties: type === "VCALENDAR" ? calendar : new Map(), observances: 0 });
+    } else if (name === "END") {
+      if (parameters.size || !component || component.type !== value.toUpperCase()) {
+        throw new Error("Invalid END.");
+      }
+      if (component.type === "VEVENT") {
+        const event = parseEvent(component.properties);
+        if (events.has(event.uid)) throw new Error("Duplicate VEVENT UID.");
+        events.set(event.uid, event);
+      } else if (component.type === "VALARM") {
+        requireProperties(component.properties, ["ACTION", "TRIGGER"]);
+      } else if (component.type === "VTIMEZONE") {
+        requireProperties(component.properties, ["TZID"]);
+        if (!component.observances) throw new Error("Invalid VTIMEZONE.");
+      } else if (component.type === "STANDARD" || component.type === "DAYLIGHT") {
+        requireProperties(component.properties, ["DTSTART", "TZOFFSETFROM", "TZOFFSETTO"]);
+        stack[stack.length - 2].observances++;
+      }
+      closed = component.type === "VCALENDAR";
+      stack.pop();
+    } else {
+      if (!component) throw new Error("Content outside VCALENDAR.");
+      if (!component.properties.has(name)) component.properties.set(name, []);
+      component.properties.get(name).push({ parameters, value });
+    }
+  }
 
-  } else {
-    // Lokale Zeit verarbeiten (ohne Z-Suffix)
-    const match = str.match(/(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})?/);
-    if (!match) return null;
+  const version = singleProperty(calendar, "VERSION");
+  const product = singleProperty(calendar, "PRODID");
+  const method = singleProperty(calendar, "METHOD");
+  if (!closed || stack.length || !componentCount || version?.value !== "2.0" || !product?.value.trim()
+      || (method && method.value.toUpperCase() !== "PUBLISH")) {
+    throw new Error("Invalid or unsupported VCALENDAR.");
+  }
+  return [...events.values()];
+}
 
-    const [ , y, m, d, h, min, s ] = match;
-    return new Date(y, m - 1, d, h, min, s || 0);
+function parseContentLine(line) {
+  const match = /^([a-z0-9-]+)((?:;[a-z0-9-]+=(?:"[^"\r\n]*"|[^";:,\r\n]*)(?:,(?:"[^"\r\n]*"|[^";:,\r\n]*))*)*):([^\x00-\x08\x0A-\x1F\x7F]*)$/i.exec(line);
+  if (!match) throw new Error("Invalid ICS content line.");
+
+  const parameters = new Map();
+  for (const parameter of match[2].matchAll(/;([a-z0-9-]+)=((?:"[^"]*"|[^";,]*)(?:,(?:"[^"]*"|[^";,]*))*)/gi)) {
+    const key = parameter[1].toUpperCase();
+    if (parameters.has(key)) throw new Error("Duplicate ICS parameter.");
+    parameters.set(key, parameter[2].replace(/^"([^"]*)"$/, "$1"));
+  }
+  return { name: match[1].toUpperCase(), parameters, value: match[3] };
+}
+
+function singleProperty(properties, name) {
+  const values = properties.get(name) || [];
+  if (values.length > 1) throw new Error("Duplicate ICS property.");
+  return values[0];
+}
+
+function requireProperties(properties, names) {
+  for (const name of names) {
+    if (!singleProperty(properties, name)?.value.trim()) throw new Error("Missing ICS property.");
   }
 }
 
-/**
- * Berechnet den Zeitzonen-Offset zwischen UTC und der angegebenen Zeitzone
- * für ein bestimmtes Datum (wichtig für Sommer-/Winterzeit)
- * @param {string} timeZone - Die Ziel-Zeitzone (z.B. "Europe/Berlin")
- * @param {Date} date - Das Datum für die Offset-Berechnung
- * @return {number} Offset in Minuten
- */
-function getTimezoneOffsetMinutes(timeZone, date) {
-  // Datum in UTC und Ziel-Zeitzone formatieren
-  const utcString = Utilities.formatDate(date, "UTC", "yyyyMMdd'T'HHmmss");
-  const tzString = Utilities.formatDate(date, timeZone, "yyyyMMdd'T'HHmmss");
-
-  // UTC-Datum aus String parsen
-  const utcDate = new Date(
-    parseInt(utcString.substring(0,4)), 
-    parseInt(utcString.substring(4,6))-1,
-    parseInt(utcString.substring(6,8)),
-    parseInt(utcString.substring(9,11)),
-    parseInt(utcString.substring(11,13)),
-    parseInt(utcString.substring(13,15))
-  );
-
-  // Zeitzonen-Datum aus String parsen
-  const tzDate = new Date(
-    parseInt(tzString.substring(0,4)), 
-    parseInt(tzString.substring(4,6))-1,
-    parseInt(tzString.substring(6,8)),
-    parseInt(tzString.substring(9,11)),
-    parseInt(tzString.substring(11,13)),
-    parseInt(tzString.substring(13,15))
-  );
-
-  // Differenz in Minuten berechnen
-  return (tzDate.getTime() - utcDate.getTime()) / (60 * 1000);
+function decodeText(value) {
+  return value.replace(/\\([nN,;\\])/g, (_, character) => character.toLowerCase() === "n" ? "\n" : character);
 }
 
-/**
- * Prüft, ob ein Event gemäß Include-/Exclude-Filter importiert werden soll
- * - Wenn INCLUDE_TERMS nicht leer: Event muss mindestens einen Begriff enthalten
- * - Wenn EXCLUDE_TERMS nicht leer: Event darf keinen Begriff enthalten
- * Es wird in Titel, Beschreibung und Ort gesucht (case-insensitive)
- * @param {{title:string, description:string, location:string}} ev
- * @return {boolean}
- */
-function shouldImportEvent(ev) {
-  const text = buildSearchText(ev);
+function parseEvent(properties) {
+  const get = name => singleProperty(properties, name);
+  const text = name => decodeText(get(name)?.value || "");
+  const uid = text("UID");
+  const title = text("SUMMARY");
+  const stamp = get("DTSTAMP");
+  if (!uid.trim() || uid.length > 1024 || /[\r\n]/.test(uid) || !title.trim()
+      || !stamp?.value.endsWith("Z") || !get("DTSTART")
+      || ["RRULE", "RDATE", "EXDATE", "EXRULE", "RECURRENCE-ID"].some(name => properties.has(name))) {
+    throw new Error("Invalid or unsupported VEVENT.");
+  }
+  parseICSTime(stamp);
 
-  // Include-Filter (falls gesetzt, mindestens ein Begriff muss vorkommen)
-  if (INCLUDE_TERMS && INCLUDE_TERMS.length > 0) {
-    if (!containsAny(text, INCLUDE_TERMS)) return false;
+  const startProperty = get("DTSTART");
+  const startTime = parseICSTime(startProperty);
+  const start = toInstant(startTime);
+  const endProperty = get("DTEND");
+  const duration = get("DURATION");
+  if (endProperty && duration) throw new Error("VEVENT has both DTEND and DURATION.");
+  let end = null;
+  if (endProperty) end = toInstant(parseICSTime(endProperty));
+  if (duration) end = durationEnd(startTime, start, duration.value);
+  if (end && end <= start) throw new Error("Invalid VEVENT end time.");
+
+  const caseNumber = text("X-AKTENZEICHEN") || text("X-CASE-NUMBER");
+  let description = text("DESCRIPTION");
+  if (caseNumber && !title.includes(caseNumber) && !description.includes(caseNumber)) {
+    description = [description, `Aktenzeichen: ${caseNumber}`].filter(Boolean).join("\n");
+  }
+  return { uid, title, start, end, description, location: text("LOCATION") };
+}
+
+function parseICSTime({ value, parameters }) {
+  const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)$/.exec(value);
+  const zone = parameters.get("TZID");
+  const type = parameters.get("VALUE");
+  if (!match || (parameters.has("TZID") && zone !== SOURCE_TIME_ZONE)
+      || (type !== undefined && type.toUpperCase() !== "DATE-TIME") || (zone && match[7])) {
+    throw new Error("Invalid or unsupported ICS date-time.");
   }
 
-  // Exclude-Filter (falls gesetzt, keiner der Begriffe darf vorkommen)
-  if (EXCLUDE_TERMS && EXCLUDE_TERMS.length > 0) {
-    if (containsAny(text, EXCLUDE_TERMS)) return false;
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+  const wallTime = new Date(0);
+  wallTime.setUTCFullYear(year, month - 1, day);
+  wallTime.setUTCHours(hour, minute, Math.min(second, 59), 0);
+  if (!year || wallTime.getUTCFullYear() !== year || wallTime.getUTCMonth() !== month - 1
+      || wallTime.getUTCDate() !== day || wallTime.getUTCHours() !== hour
+      || wallTime.getUTCMinutes() !== minute || second > 60) {
+    throw new Error("Invalid ICS date-time.");
+  }
+  return { wallTime, isUtc: Boolean(match[7]) };
+}
+
+function toInstant({ wallTime, isUtc }) {
+  return isUtc ? wallTime : berlinTime(wallTime);
+}
+
+function berlinTime(wallTime) {
+  const day = 86400000;
+  const minute = 60000;
+  const wall = wallTime.getTime();
+  const before = berlinOffset(new Date(wall - day));
+  const after = berlinOffset(new Date(wall + day));
+  const candidates = [before, after]
+    .map(offset => new Date(wall - offset * minute))
+    .filter(date => date.getTime() + berlinOffset(date) * minute === wall);
+  // RFC 5545 uses the first occurrence in an overlap and the pre-transition offset in a gap.
+  return candidates.length ? new Date(Math.min(...candidates)) : new Date(wall - before * minute);
+}
+
+function berlinOffset(date) {
+  const offset = Utilities.formatDate(date, SOURCE_TIME_ZONE, "Z");
+  const minutes = Number(offset.slice(1, 3)) * 60 + Number(offset.slice(3, 5));
+  return offset.startsWith("-") ? -minutes : minutes;
+}
+
+function durationEnd({ wallTime, isUtc }, start, duration) {
+  const match = /^\+?P(?:(\d+)W|(?:(\d+)D)?(?:T(?=\d)(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?)$/.exec(duration);
+  if (!match || !match.slice(1).some(Boolean)) throw new Error("Invalid VEVENT duration.");
+  const [weeks, days, hours, minutes, seconds] = match.slice(1).map(value => Number(value || 0));
+  const calendarDays = weeks * 7 + days;
+  let base = start.getTime();
+
+  if (calendarDays) {
+    const endWallTime = new Date(wallTime.getTime() + calendarDays * 86400000);
+    base = toInstant({ wallTime: endWallTime, isUtc }).getTime();
+  }
+  const end = new Date(base + ((hours * 60 + minutes) * 60 + seconds) * 1000);
+  if (!Number.isFinite(end.getTime()) || end <= start || end.getUTCFullYear() > 9999) {
+    throw new Error("Invalid VEVENT duration.");
+  }
+  return end;
+}
+
+function shouldImportEvent(event) {
+  const text = [event.title, event.description, event.location].join("\n").toLowerCase();
+  const matches = terms => terms.some(term => text.includes(String(term).toLowerCase()));
+  return (!INCLUDE_TERMS.length || matches(INCLUDE_TERMS)) && !matches(EXCLUDE_TERMS);
+}
+
+function calendarResource(event) {
+  const end = ENABLE_DURATION_MODIFICATION || !event.end
+    ? new Date(event.start.getTime() + EVENT_DURATION_MINUTES * 60000)
+    : event.end;
+  if (!Number.isFinite(end.getTime()) || end <= event.start || end.getUTCFullYear() > 9999) {
+    throw new Error("Invalid calendar event duration.");
+  }
+  return {
+    summary: EVENT_PREFIX ? `${EVENT_PREFIX} ${event.title}` : event.title,
+    description: event.description,
+    location: event.location,
+    start: { dateTime: event.start.toISOString() },
+    end: { dateTime: end.toISOString() },
+    reminders: {
+      useDefault: false,
+      overrides: REMINDER_MINUTES.map(minutes => ({ method: "popup", minutes })),
+    },
+  };
+}
+
+function reconcileCalendar(events, desired) {
+  const managed = new Map();
+  const options = { privateExtendedProperty: [`calendarSyncSource=${SYNC_SOURCE}`], showDeleted: false };
+  let page;
+  do {
+    page = Calendar.Events.list(CALENDAR_ID, options);
+    for (const event of page.items || []) {
+      const properties = event.extendedProperties?.private;
+      if (event.status === "cancelled" || properties?.calendarSyncSource !== SYNC_SOURCE) continue;
+      const uid = properties.calendarSyncUid;
+      if (!uid || !event.id || !event.etag || managed.has(uid)) throw new Error("Invalid managed event identity.");
+      managed.set(uid, event);
+    }
+    options.pageToken = page.nextPageToken;
+  } while (options.pageToken);
+
+  const counts = { added: 0, updated: 0, deleted: 0 };
+  for (const { uid, resource } of desired) {
+    const existing = managed.get(uid);
+    if (!existing) {
+      Calendar.Events.insert({
+        ...resource,
+        extendedProperties: { private: { calendarSyncSource: SYNC_SOURCE, calendarSyncUid: uid } },
+      }, CALENDAR_ID);
+      counts.added++;
+    } else if (!calendarEventMatches(existing, resource)) {
+      Calendar.Events.patch(resource, CALENDAR_ID, existing.id, {}, { "If-Match": existing.etag });
+      counts.updated++;
+    }
   }
 
-  return true;
+  const feedUids = new Set(events.map(event => event.uid));
+  for (const [uid, event] of managed) {
+    if (!feedUids.has(uid)) {
+      Calendar.Events.remove(CALENDAR_ID, event.id, {}, { "If-Match": event.etag });
+      counts.deleted++;
+    }
+  }
+  return counts;
 }
 
-/**
- * Baut einen durchsuchbaren Text aus Titel, Beschreibung und Ort
- * @param {{title:string, description:string, location:string}} ev
- * @return {string}
- */
-function buildSearchText(ev) {
-  return [ev.title || "", ev.description || "", ev.location || ""]
-    .join(" \n ")
-    .toLowerCase();
-}
-
-/**
- * Prüft, ob einer der Begriffe im Text vorkommt (case-insensitive)
- * @param {string} text
- * @param {string[]} terms
- * @return {boolean}
- */
-function containsAny(text, terms) {
-  const normalized = text.toLowerCase();
-  return terms.some(t => normalized.includes(String(t).toLowerCase()));
+function calendarEventMatches(existing, resource) {
+  const reminders = existing.reminders?.overrides || [];
+  return existing.summary === resource.summary
+    && (existing.description || "") === resource.description
+    && (existing.location || "") === resource.location
+    && Date.parse(existing.start?.dateTime) === Date.parse(resource.start.dateTime)
+    && Date.parse(existing.end?.dateTime) === Date.parse(resource.end.dateTime)
+    && existing.reminders?.useDefault === false
+    && reminders.length === REMINDER_MINUTES.length
+    && REMINDER_MINUTES.every(minutes => reminders.some(reminder => reminder.method === "popup" && reminder.minutes === minutes));
 }
